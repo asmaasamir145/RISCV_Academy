@@ -161,3 +161,192 @@ build files. Pass them with `-D<VAR>=value` at configure time.
   `Image::Read(width, height, data)`. `Write` is not supported on gem5.
 
 See [IMAGEIO.md](IMAGEIO.md) for formats and examples.
+
+## BoxFilter Task
+
+The `BoxFilter_Task` branch implements a uniform box filter for `CV_8UC1`
+images with an OpenCV-shaped interface:
+
+```cpp
+vec::boxFilter(src, dst, ddepth, Size(width, height),
+               Point(anchor_x, anchor_y), normalize, border_type);
+```
+
+`ddepth` accepts `-1`, `CV_8U`, or `CV_8UC1`. Kernel dimensions are runtime
+parameters and must be positive and odd; tests cover 1x1 through 11x11 as well
+as a rectangular 5x11 kernel. `Point(-1, -1)` selects the kernel center.
+`BORDER_CONSTANT` uses zero padding, `BORDER_REPLICATE` repeats the nearest
+edge pixel, and the OpenCV-compatible default is `BORDER_REFLECT_101`.
+Normalized results are rounded to nearest; unnormalized results are saturated
+to the 8-bit output range.
+
+The caller preallocates input and output. The scalar and RVV kernels do not use
+dynamic allocation, so input/output aliasing (in-place filtering) is not
+supported.
+
+### BoxFilter files
+
+- Scalar correctness reference:
+  [`test/reference/source/image_BoxFilter.cpp`](test/reference/source/image_BoxFilter.cpp)
+- RVV implementation:
+  [`lib/source/image_BoxFilter.cpp`](lib/source/image_BoxFilter.cpp)
+- Unit tests:
+  [`test/unit_test/source/BoxFilter_test.cpp`](test/unit_test/source/BoxFilter_test.cpp)
+- One-iteration comparative benchmark:
+  [`benchmark/source/BoxFilter_benchmark.cpp`](benchmark/source/BoxFilter_benchmark.cpp)
+
+### Scalar approach
+
+The scalar oracle retains a fixed-work 3x3 centered path so the established
+gem5 comparison does not regress merely because the public API became generic.
+Other kernel shapes directly evaluate the complete neighborhood for each pixel
+with a 64-bit accumulator. Both paths implement the selected border
+extrapolation independently from the RVV kernel.
+
+### RVV approach
+
+The RVV implementation retains a specialized 3x3 path using 16-bit widening,
+vertical reduction, vector slides, and exact multiply-high division. Other
+kernel sizes use 32-bit vector accumulators. When the kernel width fits the
+available vector lanes, each source row is loaded once per chunk, reduced
+vertically, and reused through `vslidedown`; larger valid kernels fall back to
+a direct vector-tap loop. All paths use dynamic `vl` values and handle tails
+without assuming a fixed VLEN. Border bands are computed separately so the
+interior vector loop never performs out-of-bounds loads.
+
+### How each benchmark kernel works
+
+All benchmark cases apply a normalized box blur: every output pixel is the
+rounded average of the pixels in its square neighborhood. A larger kernel
+therefore produces a stronger blur, but requires more row reductions and
+horizontal additions.
+
+| Kernel | RVV processing |
+| --- | --- |
+| 3x3 | Uses the dedicated fast path. Three source rows are loaded per vector chunk and widened to 16 bits, then added vertically. Two `vslidedown` operations align the neighboring column sums, and two vector additions produce all overlapping 3x3 sums. Adding 4 followed by multiply-high with 7282 implements exact round-to-nearest division by 9. |
+| 5x5 | Uses the generic 32-bit sliding path. Five loaded rows are reduced vertically, then four slides and additions combine five adjacent column sums before division by 25. |
+| 7x7 | Uses the same generic path with seven vertically reduced rows and six horizontal slides/additions, followed by division by 49. |
+| 9x9 | Uses nine row contributions and eight horizontal slides/additions, followed by division by 81. |
+| 11x11 | Uses eleven row contributions and ten horizontal slides/additions, followed by division by 121. |
+
+The 3x3 case is specially optimized because it is the common small blur and
+its maximum sum fits safely in 16 bits. Most importantly, border handling is
+not performed inside its hot RVV loop. The narrow outer border is calculated
+separately using the selected border mode, while the vector loop processes only
+interior pixels whose complete 3x3 neighborhood is already in bounds. Removing
+per-lane border checks and coordinate correction from the hot loop makes a
+large performance difference. The border is not omitted from the output; it is
+simply separated from the optimized interior calculation.
+
+### Run the BoxFilter tests
+
+The unit test uses deliberately small and irregular images because its purpose
+is exact correctness checking, not performance measurement. Small 3x3 cases
+make border and rounding results easy to calculate by hand, while 1-pixel-wide
+images and widths around a vector chunk boundary (31, 63, 64, and 65) expose
+edge, vector-tail, and out-of-bounds bugs. Every output pixel from the RVV
+implementation is compared with the independent scalar reference. Additional
+cases check constant, replicate, and default borders; normalized rounding;
+8-bit saturation; different kernel shapes; and centered and explicit anchors.
+
+The three BoxFilter programs therefore have different roles:
+
+- `BoxFilter_test.cpp` is a small, fast correctness and regression test. Run it
+  after changing the filter, compiler flags, or toolchain.
+- `BoxFilter_example.cpp` demonstrates the filter on an actual image and writes
+  an output image where hosted file I/O is available.
+- `BoxFilter_benchmark.cpp` processes a large image to compare scalar and RVV
+  performance. Use its gem5 run for meaningful cycle and instruction counts.
+
+The same tests can run under QEMU and gem5. QEMU provides fast functional
+feedback, while gem5 validates the bare-metal build on the simulated XiangShan
+CPU model. The exhaustive test of every possible 3x3 sum is omitted from the
+gem5 bare-metal build; the remaining BoxFilter tests run in both environments.
+
+```bash
+# Fast functional validation
+cmake --build build --target run_BoxFilter_test_qemu
+
+# Bare-metal validation on the gem5 CPU model
+cmake --build build --target run_BoxFilter_test_gem5
+
+# Full QEMU suite
+cmake --build build --target run_unit_tests_qemu
+
+# Full gem5 suite
+cmake --build build --target run_unit_tests_gem5
+```
+
+The tests compare scalar and RVV output across both border modes, odd kernel
+sizes, explicit/default anchors, vector tails, rounding, and saturation.
+
+### Benchmark scalar versus RVV
+
+The benchmark runs every square odd kernel from 3x3 through 11x11 (3, 5, 7,
+9, and 11) for one iteration.
+Allocation and initialization remain outside timed regions. Each iteration
+checks scalar/RVV equality and the report includes average cycles, retired
+instructions, cycles per pixel, pixels per cycle, and speedup.
+
+### Measured gem5 results
+
+The measured gem5 results below use the 640x960 image and one iteration per
+kernel. They are preserved in
+`build/benchmark/BoxFilter_benchmark_gem5.log`:
+
+| Kernel and border | Scalar cycles | Scalar cycles/pixel | Scalar instructions | RVV cycles | RVV cycles/pixel | RVV instructions | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3x3 constant | 2,602,478 | 4.235804 | 16,576,463 | 962,671 | 1.566847 | 363,286 | 2.703x |
+| 5x5 replicate | 46,742,251 | 76.077881 | 230,504,743 | 5,990,412 | 9.750019 | 4,057,176 | 7.803x |
+| 7x7 replicate | 78,751,157 | 128.175720 | 410,044,903 | 9,021,497 | 14.683426 | 8,505,092 | 8.729x |
+
+Results depend on the compiler, simulator configuration, image, and vector
+length, so this table should be updated whenever the benchmark is rerun under
+different conditions.
+
+```bash
+# Fast functional benchmark
+cmake --build build --target run_BoxFilter_benchmark_qemu
+
+# Run this yourself for cycle-accurate gem5 performance. Remove the fork's
+# default instruction limits so every kernel is reported.
+cmake -S . -B build \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/riscv64_xs_toolchain.cmake \
+  -DGEM5_EXTRA_ARGS="--disable-difftest --maxinsts=0 --warmup-insts-no-switch=0"
+cmake --build build --target run_BoxFilter_benchmark_gem5
+```
+
+The gem5 run can take substantially longer than QEMU. Its console log and
+statistics are written to:
+
+```text
+build/benchmark/BoxFilter_benchmark_gem5.log
+build/benchmark/BoxFilter_benchmark_gem5-m5out/
+```
+
+QEMU is used here only for functional validation and confirming that the
+benchmark completes. Its user-mode CSR values are not reliable performance
+measurements; use gem5 for cycle and retired-instruction comparisons.
+
+### Run the BoxFilter visualization
+
+The interactive, step-by-step website is in
+[`boxfilter-visualizer/`](boxfilter-visualizer/). Start the server from the
+repository root because the page loads the sample image from `images/`:
+
+```bash
+python3 -m http.server 8000
+```
+
+Open <http://localhost:8000/boxfilter-visualizer/#rvv>.
+
+The page visualizes the memory layout, three row loads, vertical reduction,
+slides, horizontal accumulation, divide-by-nine conversion, narrowing, and
+final store. If port 8000 reports `Address already in use`, the existing server
+is usually still running. Open the link above, or use another port:
+
+```bash
+python3 -m http.server 8001
+```
+
+Then open <http://localhost:8001/boxfilter-visualizer/#rvv>.
