@@ -43,6 +43,33 @@ private:
         data = new T[stride * _height];
     }
 
+    static int MapCoord(int p , const int len , const BorderType type){
+        if (p >= 0 && p<len) return p ; 
+
+        switch(type){
+            case BorderType::NO_BORDER : 
+            return -1 ; 
+
+            case BorderType::REPLICATE : 
+            return p<0 ? 0 :len -1 ; 
+
+            case BorderType::CONSTANT : 
+            return -1 ; 
+
+            case BorderType::MIRROR:
+            if (len == 1) return 0;
+            while (p < 0 || p >= len)   
+                p = (p < 0) ? -p : (2 * len - 2 - p);
+            return p; 
+
+        }
+        return -1 ; 
+
+    }
+
+    
+
+
 public:
     Image() : width(0), height(0), stride(0), data(nullptr) {}
     Image(int width, int height)
@@ -85,6 +112,39 @@ public:
         return *this;
     }
 
+    T GetPixelBorder (const int x , const int  y ,  const int c =0 , 
+                      const BorderType type  =  BorderType::NO_BORDER ,const T & value =T{})const
+    {
+      const int sx = MapCoord(x,width,type); 
+      const int sy = MapCoord(y, height, type); 
+      if(sx<0 || sy<0) return value ; 
+      return data[index(sx,sy,c)];
+    }
+
+    void MakeBorder (Image &out ,int pad ,  const BorderType type = BorderType::NO_BORDER ,  const T& value = T{})const {
+        if (type == BorderType::NO_BORDER) pad = 0; 
+        for (int y =0 ; y<out.height ; ++y)
+            for (int x = 0; x < out.width; ++x)
+                for (int c = 0; c < Channels(); ++c)
+                    out.SetPixel(x, y,
+                        GetPixelBorder(x - pad, y - pad, c, type, value), c);
+    }
+              
+    int GetWidth() {
+        return width ; 
+    }
+    int GetHeight(){
+        return height ; 
+    }
+    int Getsize() const
+    {
+        return width * height;
+    }
+    T GetPixel_index(const int index) const
+    {
+        return data[index];
+    }
+
     T GetPixel(const int x, const int y, const int c = 0) const
     {
         return data[index(x, y, c)];
@@ -93,6 +153,10 @@ public:
     void SetPixel(const int x, const int y, const T& value, const int c = 0)
     {
         data[index(x, y, c)] = value;
+    }
+    void SetPixel_index(const int index, const T& value)
+    {
+        data[index] = value;
     }
 
     T* GetPtr(const int x, const int y)

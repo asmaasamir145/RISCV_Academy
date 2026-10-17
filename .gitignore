@@ -1,1 +1,4 @@
-build/*
+build/*build/
+CMakeUserPresets.json
+build/
+m5out*
